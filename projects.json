@@ -1,17 +1,5 @@
 {
   "projects": [
-    {
-      "name": "nodewarden",
-      "owner": "mrjg117",
-      "repo": "nodewarden",
-      "upstream": "shuaiplus/nodewarden",
-      "branch": "main",
-      "fork_branch": "main",
-      "key_files": "wrangler.toml package.json src/index.ts",
-      "max_deleted": 50,
-      "max_delete_pct": 30,
-      "ci_gate": true,
-      "enabled": true
-    }
+    { "fork": "mrjg117/nodewarden", "upstream": "shuaiplus/nodewarden" }
   ]
 }
