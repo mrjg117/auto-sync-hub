@@ -1,0 +1,72 @@
+name: Upstream Auto Sync Hub
+
+on:
+  schedule:
+    - cron: "47 16 * * *" # UTC 16:47，北京时间 00:47
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-sync-hub
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: 读取同步列表
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: targets
+        run: |
+          set -euo pipefail
+          MATRIX=$(jq -c '{include: [.projects[] | select(.enabled == true)]}' projects.json)
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 同步目标"
+            echo
+            echo '```json'
+            echo "$MATRIX" | jq .
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sync:
+    name: 同步 ${{ matrix.name }}
+    needs: prepare
+    if: needs.prepare.outputs.matrix != '{"include":[]}'
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 换取 GitHub App token
+        id: app
+        uses: actions/create-github-app-token@v3.4.0
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ matrix.owner }}
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+          permission-workflows: write
+          permission-metadata: read
+
+      - name: 执行同步
+        uses: ./.github/actions/upstream-sync
+        with:
+          fork: ${{ matrix.owner }}/${{ matrix.repo }}
+          upstream: ${{ matrix.upstream }}
+          branch: ${{ matrix.branch }}
+          fork-branch: ${{ matrix.fork_branch }}
+          key-files: ${{ matrix.key_files }}
+          max-deleted: ${{ matrix.max_deleted }}
+          max-delete-pct: ${{ matrix.max_delete_pct }}
+          ci-gate: ${{ matrix.ci_gate }}
+          token: ${{ steps.app.outputs.token }}
+          read-token: ${{ github.token }}
