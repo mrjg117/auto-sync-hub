@@ -1,0 +1,202 @@
+name: Upstream sync
+description: 检查上游健康状态并自动更新 fork（ff 优先，冲突即停）
+
+inputs:
+  fork:
+    description: 目标 fork，格式 owner/repo
+    required: true
+  upstream:
+    description: 上游仓库，格式 owner/repo
+    required: true
+  branch:
+    description: 上游分支
+    required: false
+    default: main
+  fork-branch:
+    description: fork 分支
+    required: false
+    default: main
+  key-files:
+    description: 必须存在的关键文件（空格分隔）
+    required: false
+    default: wrangler.toml package.json src/index.ts
+  max-deleted:
+    description: 单次允许删除的最大文件数
+    required: false
+    default: "50"
+  max-delete-pct:
+    description: 单次允许删除的最大百分比
+    required: false
+    default: "30"
+  ci-gate:
+    description: 是否要求上游候选提交 CI 全绿
+    required: false
+    default: "true"
+  token:
+    description: GitHub App installation token（需要 contents/workflows 写权限）
+    required: true
+  read-token:
+    description: 读取上游公开仓库状态与 check-runs 的 token
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: 克隆 fork 并拉取上游
+      shell: bash
+      run: |
+        set -euo pipefail
+        REPO="$RUNNER_TEMP/sync-repo"
+        echo "SYNC_REPO=$REPO" >> "$GITHUB_ENV"
+        git clone --quiet --branch "${{ inputs.fork-branch }}" "https://github.com/${{ inputs.fork }}.git" "$REPO"
+        git -C "$REPO" config user.name "github-actions[bot]"
+        git -C "$REPO" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git -C "$REPO" remote add upstream "https://github.com/${{ inputs.upstream }}.git"
+        git -C "$REPO" fetch --no-tags upstream "+refs/heads/${{ inputs.branch }}:refs/remotes/upstream/${{ inputs.branch }}" || echo "upstream fetch failed"
+
+    - name: 上游状态与 CI 门禁
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.read-token }}
+        UPSTREAM: ${{ inputs.upstream }}
+        BRANCH: ${{ inputs.branch }}
+        CI_GATE: ${{ inputs.ci-gate }}
+        STATE_FILE: .github/upstream-sync-state
+      run: |
+        set -uo pipefail
+        cd "$SYNC_REPO"
+        skip() {
+          local msg="${1//$'\n'/ }"
+          echo "SYNC_RESULT=skip" >> "$GITHUB_ENV"
+          echo "SYNC_REASON=$msg" >> "$GITHUB_ENV"
+          { echo "### 同步跳过：${{ inputs.fork }}"; echo; echo "- $msg"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "SKIP: $msg"
+          exit 0
+        }
+        fail() { echo "::error::${{ inputs.fork }}: $1"; exit 1; }
+
+        if ! gh api "repos/${UPSTREAM}" > repo.json 2>repo.err; then
+          if grep -Eq 'HTTP 404|Not Found' repo.err; then
+            skip "上游仓库已删除、转为私有或改名（API 404），未修改任何文件。"
+          fi
+          fail "无法读取上游仓库状态（API 失败），未修改任何文件。"
+        fi
+        FULL=$(jq -r '.full_name' repo.json)
+        [ "${FULL,,}" = "${UPSTREAM,,}" ] || skip "上游仓库已改名（full_name=$FULL）。"
+        [ "$(jq -r '.archived' repo.json)" = "false" ] || skip "上游仓库已归档。"
+        [ "$(jq -r '.disabled' repo.json)" = "false" ] || skip "上游仓库已禁用。"
+        [ "$(jq -r '.default_branch' repo.json)" = "$BRANCH" ] || skip "上游默认分支已变更。"
+
+        CANDIDATE=$(git rev-parse "refs/remotes/upstream/${BRANCH}" 2>/dev/null || true)
+        [ -n "$CANDIDATE" ] || fail "无法解析上游 HEAD。"
+        git cat-file -e "${CANDIDATE}^{commit}" 2>/dev/null || fail "候选提交不可达。"
+
+        if git merge-base --is-ancestor "$CANDIDATE" HEAD; then
+          skip "fork 已包含上游最新提交 ${CANDIDATE:0:7}，无需同步。"
+        fi
+
+        LAST_SHA=$(sed -n 's/^sha=//p' "$STATE_FILE" 2>/dev/null || true)
+        if [ -n "$LAST_SHA" ] && ! git merge-base --is-ancestor "$LAST_SHA" "$CANDIDATE" 2>/dev/null; then
+          fail "检测到上游历史被改写（上次同步点 ${LAST_SHA:0:7} 不在当前历史）。"
+        fi
+
+        if [ "$CI_GATE" = "true" ]; then
+          if ! gh api "repos/${UPSTREAM}/commits/${CANDIDATE}/check-runs?per_page=100" > checks.json 2>ci.err; then
+            fail "无法读取上游 CI 检查结果（API 失败）。"
+          fi
+          COUNT=$(jq -r '.total_count // 0' checks.json)
+          [ "$COUNT" -gt 0 ] || skip "上游该提交没有任何 CI 检查记录，无法判定版本正常。"
+          BAD=$(jq -r '[.check_runs[] | select(.status != "completed" or .conclusion == null or .conclusion == "failure" or .conclusion == "error" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "startup_failure") | .name] | join(", ")' checks.json)
+          [ -z "$BAD" ] || skip "上游当前版本 CI 未通过或仍在运行：$BAD。"
+        fi
+
+        echo "SYNC_RESULT=ok" >> "$GITHUB_ENV"
+        echo "SYNC_CANDIDATE=$CANDIDATE" >> "$GITHUB_ENV"
+        echo "SYNC_LAST_SHA=$LAST_SHA" >> "$GITHUB_ENV"
+        echo "门禁通过：$CANDIDATE"
+
+    - name: 内容检查
+      if: env.SYNC_RESULT == 'ok'
+      shell: bash
+      env:
+        KEY_FILES: ${{ inputs.key-files }}
+        MAX_DELETED: ${{ inputs.max-deleted }}
+        MAX_DELETE_PCT: ${{ inputs.max-delete-pct }}
+        STATE_FILE: .github/upstream-sync-state
+      run: |
+        set -euo pipefail
+        cd "$SYNC_REPO"
+        for f in $KEY_FILES; do
+          if ! git cat-file -e "${SYNC_CANDIDATE}:${f}" 2>/dev/null; then
+            echo "::error::上游版本缺少关键文件 $f（疑似被清空）。"; exit 1
+          fi
+        done
+        TOTAL=$(git ls-tree -r --name-only "$SYNC_CANDIDATE" | wc -l | tr -d ' ')
+        BASE="${SYNC_LAST_SHA:-HEAD}"
+        DELETED=$(git diff --name-status "$BASE..$SYNC_CANDIDATE" | grep -c '^D' || true)
+        LAST_COUNT=$(sed -n 's/^files=//p' "$STATE_FILE" 2>/dev/null || true)
+        echo "文件总数 $TOTAL（上次记录 ${LAST_COUNT:-无}），本次删除 $DELETED"
+        if [ "$DELETED" -gt "$MAX_DELETED" ]; then
+          echo "::error::本次删除 $DELETED 个文件，超过阈值 $MAX_DELETED。"; exit 1
+        fi
+        if [ -n "$LAST_COUNT" ] && [ "$LAST_COUNT" -gt 0 ]; then
+          if [ $((TOTAL * 2)) -lt "$LAST_COUNT" ]; then
+            echo "::error::文件总数从 $LAST_COUNT 跌到 $TOTAL（腰斩）。"; exit 1
+          fi
+          PCT=$((DELETED * 100 / LAST_COUNT))
+          if [ "$PCT" -gt "$MAX_DELETE_PCT" ]; then
+            echo "::error::删除比例 ${PCT}% 超过阈值 ${MAX_DELETE_PCT}%。"; exit 1
+          fi
+        fi
+        echo "SYNC_TOTAL=$TOTAL" >> "$GITHUB_ENV"
+
+    - name: 试合并检测冲突
+      if: env.SYNC_RESULT == 'ok'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$SYNC_REPO"
+        if git merge-base --is-ancestor HEAD "$SYNC_CANDIDATE"; then
+          echo "SYNC_MODE=ff" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        git merge --no-commit --no-ff "$SYNC_CANDIDATE" >/dev/null 2>&1 || true
+        CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+        git merge --abort 2>/dev/null || true
+        if [ -n "$CONFLICTS" ]; then
+          echo "::error::合并冲突：$CONFLICTS。请人工处理后重跑，未推送。"; exit 1
+        fi
+        echo "SYNC_MODE=merge" >> "$GITHUB_ENV"
+
+    - name: 合并、记录状态并推送
+      if: env.SYNC_RESULT == 'ok'
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        UPSTREAM: ${{ inputs.upstream }}
+        FORK: ${{ inputs.fork }}
+        FORK_BRANCH: ${{ inputs.fork-branch }}
+        STATE_FILE: .github/upstream-sync-state
+      run: |
+        set -euo pipefail
+        cd "$SYNC_REPO"
+        mkdir -p "$(dirname "$STATE_FILE")"
+        if [ "$SYNC_MODE" = "ff" ]; then
+          git merge --ff-only "$SYNC_CANDIDATE"
+          printf 'sha=%s\nfiles=%s\n' "$SYNC_CANDIDATE" "$SYNC_TOTAL" > "$STATE_FILE"
+          git add "$STATE_FILE"
+          git commit -m "chore: record upstream sync state"
+        else
+          git merge --no-commit --no-ff "$SYNC_CANDIDATE"
+          printf 'sha=%s\nfiles=%s\n' "$SYNC_CANDIDATE" "$SYNC_TOTAL" > "$STATE_FILE"
+          git add "$STATE_FILE"
+          git commit -m "chore: auto-sync from ${UPSTREAM}@${SYNC_CANDIDATE:0:7}"
+        fi
+        git push "https://x-access-token:${TOKEN}@github.com/${FORK}.git" "HEAD:refs/heads/${FORK_BRANCH}"
+        {
+          echo "### 同步完成：${FORK}"
+          echo
+          echo "- 上游提交：${SYNC_CANDIDATE}"
+          echo "- 合并方式：${SYNC_MODE}"
+          echo "- 文件总数：${SYNC_TOTAL}"
+        } >> "$GITHUB_STEP_SUMMARY"
