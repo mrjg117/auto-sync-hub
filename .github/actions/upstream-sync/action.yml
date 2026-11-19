@@ -33,7 +33,7 @@ inputs:
     required: false
     default: "true"
   token:
-    description: GitHub App installation token（需要 contents/workflows 写权限）
+    description: 用于推送到目标 fork 的 classic PAT（public_repo + workflow，私有仓库另加 repo）
     required: true
   read-token:
     description: 读取上游公开仓库状态与 check-runs 的 token
