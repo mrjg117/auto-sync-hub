@@ -77,7 +77,7 @@ runs:
         skip() {
           local msg="${1//$'\n'/ }"
           echo "SYNC_RESULT=skip" >> "$GITHUB_ENV"
-          { echo "### 同步跳过：${FORK}"; echo; echo "- $msg"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "- ${FORK}：${msg}" >> "$GITHUB_STEP_SUMMARY"
           echo "SKIP: $msg"
           exit 0
         }
@@ -213,11 +213,4 @@ runs:
           git commit -m "chore: auto-sync from ${UPSTREAM}@${SYNC_CANDIDATE:0:7}"
         fi
         git push "https://x-access-token:${TOKEN}@github.com/${FORK}.git" "HEAD:refs/heads/${SYNC_FORK_BRANCH}"
-        {
-          echo "### 同步完成：${FORK}"
-          echo
-          echo "- 上游提交：${SYNC_CANDIDATE}"
-          echo "- 合并方式：${SYNC_MODE}"
-          echo "- 文件总数：${SYNC_TOTAL}"
-          echo "- 内容大小：${SYNC_BYTES} 字节"
-        } >> "$GITHUB_STEP_SUMMARY"
+        echo "- ${FORK}：已同步上游提交 ${SYNC_CANDIDATE:0:7}（${SYNC_MODE} 合并，文件 ${SYNC_TOTAL} 个 / ${SYNC_BYTES} 字节）" >> "$GITHUB_STEP_SUMMARY"
