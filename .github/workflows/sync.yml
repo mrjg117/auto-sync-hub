@@ -45,18 +45,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: 换取 GitHub App token
-        id: app
-        uses: actions/create-github-app-token@v3.4.0
-        with:
-          client-id: ${{ secrets.APP_CLIENT_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: ${{ matrix.owner }}
-          repositories: ${{ matrix.repo }}
-          permission-contents: write
-          permission-workflows: write
-          permission-metadata: read
-
       - name: 执行同步
         uses: ./.github/actions/upstream-sync
         with:
@@ -68,5 +56,5 @@ jobs:
           max-deleted: ${{ matrix.max_deleted }}
           max-delete-pct: ${{ matrix.max_delete_pct }}
           ci-gate: ${{ matrix.ci_gate }}
-          token: ${{ steps.app.outputs.token }}
+          token: ${{ secrets.SYNC_PAT }}
           read-token: ${{ github.token }}
