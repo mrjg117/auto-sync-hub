@@ -23,15 +23,22 @@ jobs:
       - id: targets
         run: |
           set -euo pipefail
-          MATRIX=$(jq -c '{include: [.projects[] | select(.enabled == true)]}' projects.json)
+          MATRIX=$(jq -c '{include: [
+            .projects[]
+            | select(.enabled != false)
+            | {
+                name: (.name // (.fork | split("/")[1])),
+                fork: .fork,
+                upstream: .upstream,
+                branch: (.branch // ""),
+                fork_branch: (.fork_branch // ""),
+                key_files: (.key_files // ""),
+                max_deleted: (.max_deleted // 50),
+                max_delete_pct: (.max_delete_pct // 30),
+                ci_gate: (.ci_gate // true)
+              }
+          ]}' projects.json)
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-          {
-            echo "### 同步目标"
-            echo
-            echo '```json'
-            echo "$MATRIX" | jq .
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
 
   sync:
     name: 同步 ${{ matrix.name }}
@@ -48,7 +55,7 @@ jobs:
       - name: 执行同步
         uses: ./.github/actions/upstream-sync
         with:
-          fork: ${{ matrix.owner }}/${{ matrix.repo }}
+          fork: ${{ matrix.fork }}
           upstream: ${{ matrix.upstream }}
           branch: ${{ matrix.branch }}
           fork-branch: ${{ matrix.fork_branch }}
