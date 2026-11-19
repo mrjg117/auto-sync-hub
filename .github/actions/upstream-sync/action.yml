@@ -77,7 +77,7 @@ runs:
         skip() {
           local msg="${1//$'\n'/ }"
           echo "SYNC_RESULT=skip" >> "$GITHUB_ENV"
-          echo "- ${FORK}: 跳过（$msg）" >> "$GITHUB_STEP_SUMMARY"
+          { echo "### 同步跳过：${FORK}"; echo; echo "- $msg"; } >> "$GITHUB_STEP_SUMMARY"
           echo "SKIP: $msg"
           exit 0
         }
@@ -85,14 +85,14 @@ runs:
 
         if ! gh api "repos/${UPSTREAM}" > repo.json 2>repo.err; then
           if grep -Eq 'HTTP 404|Not Found' repo.err; then
-            skip "上游已删除/私有/改名（404）"
+            skip "上游仓库已删除、转为私有或改名（API 404），未修改任何文件。"
           fi
-          fail "无法读取上游状态（API 失败）"
+          fail "无法读取上游仓库状态（API 失败），未修改任何文件。"
         fi
         FULL=$(jq -r '.full_name' repo.json)
-        [ "${FULL,,}" = "${UPSTREAM,,}" ] || skip "上游已改名：$FULL"
-        [ "$(jq -r '.archived' repo.json)" = "false" ] || skip "上游已归档"
-        [ "$(jq -r '.disabled' repo.json)" = "false" ] || skip "上游已禁用"
+        [ "${FULL,,}" = "${UPSTREAM,,}" ] || skip "上游仓库已改名（full_name=$FULL）。"
+        [ "$(jq -r '.archived' repo.json)" = "false" ] || skip "上游仓库已归档。"
+        [ "$(jq -r '.disabled' repo.json)" = "false" ] || skip "上游仓库已禁用。"
 
         UB="$BRANCH_INPUT"
         [ -n "$UB" ] || UB=$(jq -r '.default_branch // empty' repo.json)
@@ -102,7 +102,7 @@ runs:
         git cat-file -e "${CANDIDATE}^{commit}" 2>/dev/null || fail "候选提交不可达"
 
         if git merge-base --is-ancestor "$CANDIDATE" HEAD; then
-          skip "已是最新（${CANDIDATE:0:7}）"
+          skip "fork 已包含上游最新提交 ${CANDIDATE:0:7}，无需同步。"
         fi
 
         LAST_SHA=$(sed -n 's/^sha=//p' "$STATE_FILE" 2>/dev/null || true)
@@ -115,9 +115,9 @@ runs:
             fail "无法读取上游 CI（API 失败）"
           fi
           COUNT=$(jq -r '.total_count // 0' checks.json)
-          [ "$COUNT" -gt 0 ] || skip "上游该提交无 CI 记录，无法判定"
+          [ "$COUNT" -gt 0 ] || skip "上游该提交没有任何 CI 检查记录，无法判定版本正常。"
           BAD=$(jq -r '[.check_runs[] | select(.status != "completed" or .conclusion == null or .conclusion == "failure" or .conclusion == "error" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "startup_failure") | .name] | join(", ")' checks.json)
-          [ -z "$BAD" ] || skip "上游 CI 未通过：$BAD"
+          [ -z "$BAD" ] || skip "上游当前版本 CI 未通过或仍在运行：$BAD。"
         fi
 
         echo "SYNC_RESULT=ok" >> "$GITHUB_ENV"
@@ -213,4 +213,11 @@ runs:
           git commit -m "chore: auto-sync from ${UPSTREAM}@${SYNC_CANDIDATE:0:7}"
         fi
         git push "https://x-access-token:${TOKEN}@github.com/${FORK}.git" "HEAD:refs/heads/${SYNC_FORK_BRANCH}"
-        echo "- ${FORK}: 已同步 ${SYNC_CANDIDATE:0:7}（${SYNC_MODE}，${SYNC_TOTAL} 文件）" >> "$GITHUB_STEP_SUMMARY"
+        {
+          echo "### 同步完成：${FORK}"
+          echo
+          echo "- 上游提交：${SYNC_CANDIDATE}"
+          echo "- 合并方式：${SYNC_MODE}"
+          echo "- 文件总数：${SYNC_TOTAL}"
+          echo "- 内容大小：${SYNC_BYTES} 字节"
+        } >> "$GITHUB_STEP_SUMMARY"
