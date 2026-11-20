@@ -1,0 +1,40 @@
+name: Keepalive
+
+# 独立工作流：定期向非默认分支推空提交，重置 public 仓库 60 天无 push 导致定时任务被禁用的计时。
+# 不碰 main，不产生日志；即便 sync 工作流被禁用，本工作流仍独立运行。
+
+on:
+  schedule:
+    - cron: "13 3 * * 1" # 每周一 UTC 03:13，北京时间 11:13
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    name: 保活提交
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 推送空提交到 chore/keepalive
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="chore/keepalive"
+          # 远端已有该分支则基于它，否则基于当前 HEAD
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -B "$BRANCH"
+          fi
+          git commit --allow-empty -m "chore: keepalive $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push origin "$BRANCH"
+          echo "保活提交已推送到 $BRANCH"
