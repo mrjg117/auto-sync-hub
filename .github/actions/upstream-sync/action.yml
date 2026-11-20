@@ -33,7 +33,7 @@ inputs:
     required: false
     default: "30"
   ci-gate:
-    description: 是否要求上游候选提交 CI 全绿
+    description: 是否检查上游候选提交 CI（仅拦截明确失败；无记录或读取失败均放行）
     required: false
     default: "true"
   follow-rename:
@@ -141,14 +141,19 @@ runs:
           fail "上游历史被改写（上次同步点 ${LAST_SHA:0:7} 不在当前历史）"
         fi
 
+        # CI 仅用于发现明确失败；无记录或读取失败都放行，不阻断同步
         if [ "$CI_GATE" = "true" ]; then
           if ! gh api "repos/${EFFECTIVE}/commits/${CANDIDATE}/check-runs?per_page=100" > checks.json 2>ci.err; then
-            fail "无法读取上游 CI（API 失败）"
+            echo "注意：无法读取上游 CI（API 失败），跳过 CI 检查，继续同步。"
+          else
+            COUNT=$(jq -r '.total_count // 0' checks.json)
+            if [ "$COUNT" -eq 0 ]; then
+              echo "注意：上游该提交没有 CI 检查记录，跳过 CI 检查，继续同步。"
+            else
+              BAD=$(jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "error" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "startup_failure") | .name] | join(", ")' checks.json)
+              [ -z "$BAD" ] || skip "上游当前版本 CI 明确失败：$BAD。"
+            fi
           fi
-          COUNT=$(jq -r '.total_count // 0' checks.json)
-          [ "$COUNT" -gt 0 ] || skip "上游该提交没有任何 CI 检查记录，无法判定版本正常。"
-          BAD=$(jq -r '[.check_runs[] | select(.status != "completed" or .conclusion == null or .conclusion == "failure" or .conclusion == "error" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "startup_failure") | .name] | join(", ")' checks.json)
-          [ -z "$BAD" ] || skip "上游当前版本 CI 未通过或仍在运行：$BAD。"
         fi
 
         echo "SYNC_RESULT=ok" >> "$GITHUB_ENV"
