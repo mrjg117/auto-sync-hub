@@ -20,6 +20,10 @@ inputs:
     description: 可选：必须存在且非空的关键文件（空格分隔）；留空则不按文件名检查
     required: false
     default: ""
+  protected-files:
+    description: 可选：同步时强制保留 fork 本地版本的文件（空格分隔路径）；上游对这些文件的改动会被忽略，也不会因它们冲突
+    required: false
+    default: ""
   max-deleted:
     description: 单次允许删除的最大文件数
     required: false
@@ -63,6 +67,7 @@ runs:
         FB="$FORK_BRANCH_INPUT"
         [ -n "$FB" ] || FB=$(git rev-parse --abbrev-ref HEAD)
         echo "SYNC_FORK_BRANCH=$FB" >> "$GITHUB_ENV"
+        echo "SYNC_FORK_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
         git remote add upstream "https://github.com/${UPSTREAM}.git"
         git fetch --no-tags --quiet upstream || echo "upstream fetch failed"
 
@@ -202,6 +207,7 @@ runs:
       shell: bash
       env:
         FORK: ${{ inputs.fork }}
+        PROTECTED_FILES: ${{ inputs.protected-files }}
       run: |
         set -euo pipefail
         err() {
@@ -216,6 +222,12 @@ runs:
           exit 0
         fi
         git merge --no-commit --no-ff "$SYNC_CANDIDATE" >/dev/null 2>&1 || true
+        # 受保护文件强制恢复 fork 原始版本（顺带消解这些文件的冲突）
+        for f in $PROTECTED_FILES; do
+          if git cat-file -e "${SYNC_FORK_HEAD}:${f}" 2>/dev/null; then
+            git checkout "$SYNC_FORK_HEAD" -- "$f" 2>/dev/null || true
+          fi
+        done
         CONFLICTS=$(git diff --name-only --diff-filter=U || true)
         git merge --abort 2>/dev/null || true
         [ -z "$CONFLICTS" ] || err "合并冲突：$CONFLICTS，未推送"
@@ -228,6 +240,7 @@ runs:
         TOKEN: ${{ inputs.token }}
         UPSTREAM: ${{ inputs.upstream }}
         FORK: ${{ inputs.fork }}
+        PROTECTED_FILES: ${{ inputs.protected-files }}
         STATE_FILE: .github/upstream-sync-state
       run: |
         set -euo pipefail
@@ -241,16 +254,27 @@ runs:
         mkdir -p "$(dirname "$STATE_FILE")"
         if [ "$SYNC_MODE" = "ff" ]; then
           git merge --ff-only "$SYNC_CANDIDATE"
-          printf 'sha=%s\nfiles=%s\nbytes=%s\n' "$SYNC_CANDIDATE" "$SYNC_TOTAL" "$SYNC_BYTES" > "$STATE_FILE"
-          git add "$STATE_FILE"
-          git commit -m "chore: record upstream sync state"
         else
           git merge --no-commit --no-ff "$SYNC_CANDIDATE"
-          printf 'sha=%s\nfiles=%s\nbytes=%s\n' "$SYNC_CANDIDATE" "$SYNC_TOTAL" "$SYNC_BYTES" > "$STATE_FILE"
-          git add "$STATE_FILE"
-          git commit -m "chore: auto-sync from ${UPSTREAM}@${SYNC_CANDIDATE:0:7}"
         fi
+        # 受保护文件恢复为 fork 原始版本（仅 merge 模式；ff 表示 fork 无本地改动，直接跟随上游）
+        KEPT=""
+        if [ "$SYNC_MODE" != "ff" ]; then
+          for f in $PROTECTED_FILES; do
+            if git cat-file -e "${SYNC_FORK_HEAD}:${f}" 2>/dev/null; then
+              git checkout "$SYNC_FORK_HEAD" -- "$f" 2>/dev/null || true
+              KEPT="$KEPT $f"
+              echo "已保留本地配置：$f"
+            fi
+          done
+        fi
+        printf 'sha=%s\nfiles=%s\nbytes=%s\n' "$SYNC_CANDIDATE" "$SYNC_TOTAL" "$SYNC_BYTES" > "$STATE_FILE"
+        git add -A
+        MSG="chore: auto-sync from ${UPSTREAM}@${SYNC_CANDIDATE:0:7}"
+        git commit -m "$MSG" || echo "无改动，跳过 commit"
         git push "https://x-access-token:${TOKEN}@github.com/${FORK}.git" "HEAD:refs/heads/${SYNC_FORK_BRANCH}" || err "推送到 fork 失败（请检查 PAT 权限）"
         # 供 hub 层写日志使用的结构化结果
-        echo "SYNC_DETAIL=已同步上游提交 ${SYNC_CANDIDATE:0:7}（${SYNC_MODE} 合并，文件 ${SYNC_TOTAL} 个 / ${SYNC_BYTES} 字节）" >> "$GITHUB_ENV"
-        echo "- ${FORK}：完成 — 已同步上游提交 ${SYNC_CANDIDATE:0:7}（${SYNC_MODE} 合并，文件 ${SYNC_TOTAL} 个 / ${SYNC_BYTES} 字节）" >> "$GITHUB_STEP_SUMMARY"
+        EXTRA=""
+        [ -n "$KEPT" ] && EXTRA="，保留本地配置${KEPT}"
+        echo "SYNC_DETAIL=已同步上游提交 ${SYNC_CANDIDATE:0:7}（${SYNC_MODE} 合并，文件 ${SYNC_TOTAL} 个 / ${SYNC_BYTES} 字节${EXTRA}）" >> "$GITHUB_ENV"
+        echo "- ${FORK}：完成 — 已同步上游提交 ${SYNC_CANDIDATE:0:7}（${SYNC_MODE} 合并，文件 ${SYNC_TOTAL} 个 / ${SYNC_BYTES} 字节${EXTRA}）" >> "$GITHUB_STEP_SUMMARY"
