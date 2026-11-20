@@ -73,6 +73,7 @@ jobs:
       - name: 记录日志并回写改名
         if: always()
         env:
+          GH_TOKEN: ${{ github.token }}
           OLD_UPSTREAM: ${{ matrix.upstream }}
           FORK: ${{ matrix.fork }}
           NAME: ${{ matrix.name }}
@@ -84,47 +85,62 @@ jobs:
             echo "result=${RESULT:-空}，无需记录"
             exit 0
           fi
-          cd "$GITHUB_WORKSPACE"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          CHANGED=0
 
-          # 改名跟随成功：把配置里的 upstream 更新为新 full_name
-          if [ -n "${SYNC_RENAMED_TO:-}" ] && [ "$RESULT" = "ok" ]; then
-            jq --arg fork "$FORK" --arg new "$SYNC_RENAMED_TO" \
-              '(.projects[] | select(.fork == $fork) | .upstream) = $new' \
-              projects.json > projects.json.tmp
-            mv projects.json.tmp projects.json
-            git add projects.json && CHANGED=1
-            echo "已回写 upstream: ${OLD_UPSTREAM} -> ${SYNC_RENAMED_TO}"
-          fi
+          # 通过 Contents API 读写文件：读时取 sha，写时带 sha（不匹配则 409 重试）
+          # 并行 job 同时追加同一文件时靠 sha 乐观锁串行化，不丢行
+          api_get() {  # 输出 "sha<TAB>base64内容"，文件不存在返回 1
+            local resp
+            resp=$(gh api "repos/${GITHUB_REPOSITORY}/contents/$1?ref=main" 2>/dev/null) || return 1
+            printf '%s\t%s' "$(printf '%s' "$resp" | jq -r '.sha')" \
+              "$(printf '%s' "$resp" | jq -r '.content' | tr -d '\n')"
+          }
+          api_put() {  # $1=path $2=base64 $3=message $4=sha(可空)
+            local args=(-X PUT "repos/${GITHUB_REPOSITORY}/contents/$1" -f message="$3" -f content="$2" -f branch=main)
+            [ -n "$4" ] && args+=(-f sha="$4")
+            gh api "${args[@]}" >/dev/null 2>&1
+          }
 
-          # 每个项目一个日志文件，只追加
+          # ---- 追加统一日志 logs/sync.log ----
           TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          SAFE=$(printf '%s' "$FORK" | tr '/' '-')
-          mkdir -p logs
           if [ "$RESULT" = "ok" ]; then
-            LINE="${TS} | 完成 | ${SYNC_DETAIL:-同步成功}"
+            LINE="${TS} | 完成 | ${FORK} | ${SYNC_DETAIL:-同步成功}"
           else
-            LINE="${TS} | 错误 | ${SYNC_ERROR:-未知错误}"
+            LINE="${TS} | 错误 | ${FORK} | ${SYNC_ERROR:-未知错误}"
           fi
-          printf '%s\n' "$LINE" >> "logs/${SAFE}.log"
-          git add "logs/${SAFE}.log" && CHANGED=1
-
-          [ "$CHANGED" -eq 1 ] || exit 0
-          git commit -m "log: ${NAME} (${RESULT})" || exit 0
-
-          # 并发安全推送：fetch + rebase 到最新 main，失败重试
-          PUSHED=0
-          for i in 1 2 3 4 5; do
-            git fetch origin main >/dev/null 2>&1 || { sleep 3; continue; }
-            if git rebase origin/main >/dev/null 2>&1; then
-              if git push origin HEAD:main >/dev/null 2>&1; then
-                PUSHED=1
-                break
-              fi
+          OK=0
+          for i in $(seq 1 10); do
+            SHA=""; OLD_B64=""
+            if GOT=$(api_get "logs/sync.log"); then
+              SHA="${GOT%%$'\t'*}"; OLD_B64="${GOT#*$'\t'}"
             fi
-            git rebase --abort 2>/dev/null || true
-            sleep 3
+            OLD=""
+            [ -n "$OLD_B64" ] && OLD=$(printf '%s' "$OLD_B64" | base64 -d)
+            # 直接管道编码，避免命令替换吞掉末尾换行导致行粘连
+            if [ -n "$OLD" ]; then
+              ENCODED=$(printf '%s\n%s\n' "${OLD%$'\n'}" "$LINE" | base64 -w0)
+            else
+              ENCODED=$(printf '%s\n' "$LINE" | base64 -w0)
+            fi
+            if api_put "logs/sync.log" "$ENCODED" "log: ${NAME} (${RESULT})" "$SHA"; then
+              OK=1; break
+            fi
+            sleep 2
           done
-          [ "$PUSHED" -eq 1 ] || echo "::warning::${FORK}: 日志推送失败"
+          [ "$OK" -eq 1 ] && echo "日志已写入 logs/sync.log" || echo "::warning::${FORK}: 日志写入失败"
+
+          # ---- 改名跟随成功：回写 projects.json 的 upstream ----
+          if [ -n "${SYNC_RENAMED_TO:-}" ] && [ "$RESULT" = "ok" ]; then
+            OK=0
+            for i in $(seq 1 10); do
+              GOT=$(api_get "projects.json") || { sleep 2; continue; }
+              SHA="${GOT%%$'\t'*}"; OLD_B64="${GOT#*$'\t'}"
+              OLD=$(printf '%s' "$OLD_B64" | base64 -d)
+              NEW=$(printf '%s' "$OLD" | jq --arg fork "$FORK" --arg new "$SYNC_RENAMED_TO" \
+                '(.projects[] | select(.fork == $fork) | .upstream) = $new')
+              if api_put "projects.json" "$(printf '%s' "$NEW" | base64 -w0)" "chore: follow rename ${FORK}" "$SHA"; then
+                echo "已回写 upstream: ${OLD_UPSTREAM} -> ${SYNC_RENAMED_TO}"; OK=1; break
+              fi
+              sleep 2
+            done
+            [ "$OK" -eq 1 ] || echo "::warning::${FORK}: 改名回写失败"
+          fi
