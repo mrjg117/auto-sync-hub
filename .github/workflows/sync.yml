@@ -17,7 +17,7 @@ jobs:
     name: 读取同步列表
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # 自动维护 projects.json 的项目列表
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
       targets: ${{ steps.targets.outputs.targets }}
@@ -25,58 +25,77 @@ jobs:
       - uses: actions/checkout@v5
       - id: targets
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+          HUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           AUTO=$(jq -r '.auto_discover // false' projects.json)
 
           # 1) 自动发现：扫描账号下所有 fork，取直接 parent 作为 upstream
-          #    这是唯一目标源——fork 被删则自动从同步列表消失
           DISCOVERED='[]'
           if [ "$AUTO" = "true" ]; then
-            RAW=$(gh api --paginate "user/repos?type=owner&per_page=100" \
-              --jq '[.[] | select(.fork == true) | .full_name]' | jq -s 'add' 2>/dev/null || echo '[]')
-            # 逐个取 parent.full_name（list 接口不返回 parent）
+            RAW=$(GH_TOKEN="$SYNC_PAT" gh api --paginate "user/repos?type=owner&per_page=100" \
+              --jq '[.[] | select(.fork == true) | .full_name]' | jq -s 'if length==0 then [] else add end' 2>/dev/null || echo '[]')
+            # 逐个取 parent.full_name（list 接口不返回 parent），按 fork 名排序保证列表稳定
             DISCOVERED=$(jq -r '.[]' <<< "$RAW" | while read -r f; do
               [ -z "$f" ] && continue
-              P=$(gh api "repos/${f}" --jq '.parent.full_name // empty' 2>/dev/null || true)
+              P=$(GH_TOKEN="$SYNC_PAT" gh api "repos/${f}" --jq '.parent.full_name // empty' 2>/dev/null || true)
               [ -n "$P" ] && printf '%s\t%s\n' "$f" "$P"
-            done | jq -R -s 'split("\n") | map(select(length>0) | split("\t") | {fork: .[0], upstream: .[1]})')
+            done | jq -R -s 'split("\n") | map(select(length>0) | split("\t") | {fork: .[0], upstream: .[1]}) | sort_by(.fork)')
             echo "自动发现 fork: $(jq -c 'map(.fork)' <<< "$DISCOVERED")"
           fi
 
-          # 2) 组装目标：
-          #    auto_discover=true  → 以扫描结果为目标源，projects 仅覆盖同名项的参数（含 skip）
-          #    auto_discover=false → 完全用 projects 手动列表
-          #    排除：项目上写 skip:true（或 enabled:false）即跳过
-          MATRIX=$(jq -c --argjson disc "$DISCOVERED" --arg auto "$AUTO" '
-            (.projects // []) as $manual
-            | (if $auto == "true"
-                 then [ $disc[]
-                        | . as $d
-                        | (([$manual[] | select(.fork == $d.fork)] | first) // {}) as $m
-                        | $d + $m
-                      ]
-                 else $manual
-               end)
-            | map(select(.skip != true and .enabled != false))
-            | map({
-                name: (.name // (.fork | split("/")[1])),
-                fork: .fork,
-                upstream: .upstream,
-                branch: (.branch // ""),
-                fork_branch: (.fork_branch // ""),
-                key_files: (.key_files // ""),
-                protected_files: (.protected_files // ""),
-                max_deleted: (.max_deleted // 50),
-                max_delete_pct: (.max_delete_pct // 30),
-                ci_gate: (.ci_gate // true),
-                follow_rename: (.follow_rename // false)
-              })
-            | {include: .}
-          ' projects.json)
+          # 合并规则：以扫描结果为目标源，用户在该 fork 上已设的参数（skip/protected_files 等）全部保留
+          merge_projects() {  # $1=扫描结果 $2=用户现有列表
+            jq -c --argjson disc "$1" --argjson cur "$2" --arg auto "$AUTO" '
+              if $auto == "true"
+              then [ $disc[] | . as $d
+                     | (([$cur[] | select(.fork == $d.fork)] | first) // {}) as $m
+                     | $d + $m ]
+              else $cur end
+            ' <<< '{}'
+          }
+
+          # 2) 读远程 projects.json（拿最新内容 + sha），写回完整项目列表
+          #    fork 增删自动反映到配置；手动设的参数/skip 不丢
+          GOT=$(GH_TOKEN="$HUB_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/contents/projects.json?ref=main")
+          SHA=$(printf '%s' "$GOT" | jq -r '.sha')
+          REMOTE=$(printf '%s' "$GOT" | jq -r '.content' | base64 -d)
+          CUR=$(printf '%s' "$REMOTE" | jq -c '.projects // []')
+          NEW=$(merge_projects "$DISCOVERED" "$CUR")
+
+          if [ "$NEW" != "$CUR" ]; then
+            UPDATED=$(printf '%s' "$REMOTE" | jq --argjson p "$NEW" '.projects = $p')
+            GH_TOKEN="$HUB_TOKEN" gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/projects.json" \
+              -f message="chore: 自动维护 fork 同步列表" \
+              -f content="$(printf '%s' "$UPDATED" | base64 -w0)" \
+              -f branch=main -f sha="$SHA" >/dev/null
+            echo "已写回项目列表（$(jq 'length' <<< "$NEW") 个）: $(jq -c 'map(.fork)' <<< "$NEW")"
+          else
+            echo "项目列表无变化"
+          fi
+
+          # 3) 生成 matrix（skip/enabled=false 的不参与同步）
+          MATRIX=$(jq -c --argjson ps "$NEW" '
+            [ $ps[]
+              | select(.skip != true and .enabled != false)
+              | {
+                  name: (.name // (.fork | split("/")[1])),
+                  fork: .fork,
+                  upstream: .upstream,
+                  branch: (.branch // ""),
+                  fork_branch: (.fork_branch // ""),
+                  key_files: (.key_files // ""),
+                  protected_files: (.protected_files // ""),
+                  max_deleted: (.max_deleted // 50),
+                  max_delete_pct: (.max_delete_pct // 30),
+                  ci_gate: (.ci_gate // true),
+                  follow_rename: (.follow_rename // false)
+                }
+            ] | {include: .}
+          ' <<< '{}')
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-          echo "targets=$(jq -c 'map(.fork)' <<< "$MATRIX")" >> "$GITHUB_OUTPUT"
+          echo "targets=$(jq -c 'map(.fork)' <<< "$NEW")" >> "$GITHUB_OUTPUT"
 
   sync:
     name: 同步 ${{ matrix.name }}
