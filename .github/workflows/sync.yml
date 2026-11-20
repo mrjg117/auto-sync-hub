@@ -35,6 +35,7 @@ jobs:
                 branch: (.branch // ""),
                 fork_branch: (.fork_branch // ""),
                 key_files: (.key_files // ""),
+                protected_files: (.protected_files // ""),
                 max_deleted: (.max_deleted // 50),
                 max_delete_pct: (.max_delete_pct // 30),
                 ci_gate: (.ci_gate // true),
@@ -63,6 +64,7 @@ jobs:
           branch: ${{ matrix.branch }}
           fork-branch: ${{ matrix.fork_branch }}
           key-files: ${{ matrix.key_files }}
+          protected-files: ${{ matrix.protected_files }}
           max-deleted: ${{ matrix.max_deleted }}
           max-delete-pct: ${{ matrix.max_delete_pct }}
           ci-gate: ${{ matrix.ci_gate }}
