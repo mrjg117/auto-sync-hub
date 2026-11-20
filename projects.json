@@ -1,5 +1,28 @@
 {
   "projects": [
-    { "fork": "mrjg117/nodewarden", "upstream": "shuaiplus/nodewarden" }
+    {
+      "fork": "mrjg117/2s-ui",
+      "upstream": "shenaba/2s-ui"
+    },
+    {
+      "fork": "mrjg117/nodewarden",
+      "upstream": "shuaiplus/nodewarden"
+    },
+    {
+      "fork": "mrjg117/Feishu-OIDC-Workers",
+      "upstream": "BrandonStudio/Feishu-OIDC-Workers"
+    },
+    {
+      "fork": "mrjg117/d1-manager",
+      "upstream": "neverinfamous/d1-manager"
+    },
+    {
+      "fork": "mrjg117/keyguard-app",
+      "upstream": "AChep/keyguard-app"
+    },
+    {
+      "fork": "mrjg117/s-ui",
+      "upstream": "alireza0/s-ui"
+    }
   ]
 }
