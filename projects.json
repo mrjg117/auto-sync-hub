@@ -1,9 +1,9 @@
 {
   "auto_discover": true,
   "_help": {
-    "auto_discover": "true=自动扫描账号下所有 fork 并同步；fork 删除后自动移除，无需改配置",
-    "projects": "只对需要覆盖参数或跳过的项目写条目；未列出的 fork 用默认值自动同步",
-    "skip": "在项目条目上加 \"skip\": true 即跳过该项目的自动同步",
+    "auto_discover": "true=自动扫描账号下所有 fork；列表由程序自动写回本文件的 projects，新增 fork 自动加入、删除 fork 自动移除，无需手动维护",
+    "projects": "自动生成并维护的完整 fork 列表；要排除某个项目，直接在对应条目上加 \"skip\": true；要改参数，直接在对应条目上改（重扫不会覆盖）",
+    "skip": "在 projects 里对应项目上加 \"skip\": true 即跳过该项目的自动同步",
     "参数说明": "fork/upstream 必填（自动发现时 upstream 自动取）；其余可选，见 _example"
   },
   "_example": {
