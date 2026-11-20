@@ -32,6 +32,10 @@ inputs:
     description: 是否要求上游候选提交 CI 全绿
     required: false
     default: "true"
+  follow-rename:
+    description: 上游改名时自动跟随（用新 full_name 同步并回写 projects.json）；默认关闭，仅提示
+    required: false
+    default: "false"
   token:
     description: 用于推送到目标 fork 的 classic PAT（public_repo + workflow，私有仓库另加 repo）
     required: true
@@ -69,6 +73,7 @@ runs:
         UPSTREAM: ${{ inputs.upstream }}
         BRANCH_INPUT: ${{ inputs.branch }}
         CI_GATE: ${{ inputs.ci-gate }}
+        FOLLOW_RENAME: ${{ inputs.follow-rename }}
         FORK: ${{ inputs.fork }}
         STATE_FILE: .github/upstream-sync-state
       run: |
@@ -81,7 +86,12 @@ runs:
           echo "SKIP: $msg"
           exit 0
         }
-        fail() { echo "::error::${FORK}: $1"; exit 1; }
+        fail() {
+          echo "SYNC_RESULT=error" >> "$GITHUB_ENV"
+          echo "SYNC_ERROR=${1//$'\n'/ }" >> "$GITHUB_ENV"
+          echo "::error::${FORK}: $1"
+          exit 1
+        }
 
         if ! gh api "repos/${UPSTREAM}" > repo.json 2>repo.err; then
           if grep -Eq 'HTTP 404|Not Found' repo.err; then
@@ -90,9 +100,23 @@ runs:
           fail "无法读取上游仓库状态（API 失败），未修改任何文件。"
         fi
         FULL=$(jq -r '.full_name' repo.json)
-        [ "${FULL,,}" = "${UPSTREAM,,}" ] || skip "上游仓库已改名（full_name=$FULL）。"
-        [ "$(jq -r '.archived' repo.json)" = "false" ] || skip "上游仓库已归档。"
-        [ "$(jq -r '.disabled' repo.json)" = "false" ] || skip "上游仓库已禁用。"
+        if [ "${FULL,,}" != "${UPSTREAM,,}" ] && [ "$FOLLOW_RENAME" != "true" ]; then
+          skip "上游仓库已改名（full_name=$FULL）。如需自动跟随请在配置中设 follow_rename=true。"
+        fi
+        EFFECTIVE="$UPSTREAM"
+        if [ "${FULL,,}" != "${UPSTREAM,,}" ]; then
+          EFFECTIVE="$FULL"
+          echo "上游已改名：$UPSTREAM -> $FULL，自动跟随。"
+          git remote set-url upstream "https://github.com/${EFFECTIVE}.git"
+          git fetch --no-tags --quiet upstream || fail "改名后无法 fetch 新仓库"
+          echo "SYNC_RENAMED=1" >> "$GITHUB_ENV"
+          echo "SYNC_RENAMED_TO=$FULL" >> "$GITHUB_ENV"
+        fi
+        echo "SYNC_EFFECTIVE_UPSTREAM=$EFFECTIVE" >> "$GITHUB_ENV"
+        # 归档只提示不跳过：归档仓库仍可 fetch，最后一个提交仍需同步
+        [ "$(jq -r '.archived' repo.json)" = "false" ] || echo "注意：上游仓库已归档（只读），继续检查更新。"
+        # 禁用表示 git 访问受限，无法同步
+        [ "$(jq -r '.disabled' repo.json)" = "false" ] || skip "上游仓库已被禁用（git 访问受限），跳过。"
 
         UB="$BRANCH_INPUT"
         [ -n "$UB" ] || UB=$(jq -r '.default_branch // empty' repo.json)
@@ -100,6 +124,8 @@ runs:
         CANDIDATE=$(git rev-parse "refs/remotes/upstream/${UB}" 2>/dev/null || true)
         [ -n "$CANDIDATE" ] || fail "无法解析上游 HEAD（${UB}）"
         git cat-file -e "${CANDIDATE}^{commit}" 2>/dev/null || fail "候选提交不可达"
+        echo "SYNC_CANDIDATE=$CANDIDATE" >> "$GITHUB_ENV"
+        echo "SYNC_BRANCH=$UB" >> "$GITHUB_ENV"
 
         if git merge-base --is-ancestor "$CANDIDATE" HEAD; then
           skip "fork 已包含上游最新提交 ${CANDIDATE:0:7}，无需同步。"
@@ -111,7 +137,7 @@ runs:
         fi
 
         if [ "$CI_GATE" = "true" ]; then
-          if ! gh api "repos/${UPSTREAM}/commits/${CANDIDATE}/check-runs?per_page=100" > checks.json 2>ci.err; then
+          if ! gh api "repos/${EFFECTIVE}/commits/${CANDIDATE}/check-runs?per_page=100" > checks.json 2>ci.err; then
             fail "无法读取上游 CI（API 失败）"
           fi
           COUNT=$(jq -r '.total_count // 0' checks.json)
@@ -136,36 +162,37 @@ runs:
         FORK: ${{ inputs.fork }}
       run: |
         set -euo pipefail
+        err() {
+          echo "SYNC_RESULT=error" >> "$GITHUB_ENV"
+          echo "SYNC_ERROR=${1//$'\n'/ }" >> "$GITHUB_ENV"
+          echo "::error::${FORK}: $1"
+          exit 1
+        }
         cd "$SYNC_REPO"
         if [ -n "$KEY_FILES" ]; then
           for f in $KEY_FILES; do
-            git cat-file -e "${SYNC_CANDIDATE}:${f}" 2>/dev/null || {
-              echo "::error::${FORK}: 缺少关键文件 $f"; exit 1; }
+            git cat-file -e "${SYNC_CANDIDATE}:${f}" 2>/dev/null || err "缺少关键文件 $f"
             SZ=$(git cat-file -s "${SYNC_CANDIDATE}:${f}" 2>/dev/null || echo 0)
-            [ "$SZ" -gt 0 ] || { echo "::error::${FORK}: 关键文件 $f 为空"; exit 1; }
+            [ "$SZ" -gt 0 ] || err "关键文件 $f 为空"
           done
         fi
         TOTAL=$(git ls-tree -r --name-only "$SYNC_CANDIDATE" | wc -l | tr -d ' ')
         BYTES=$(git ls-tree -r -l "$SYNC_CANDIDATE" | awk '$2=="blob"{s+=$4} END{print s+0}')
-        [ "$TOTAL" -gt 0 ] || { echo "::error::${FORK}: 候选树文件数为 0"; exit 1; }
+        [ "$TOTAL" -gt 0 ] || err "候选树文件数为 0"
         BASE="${SYNC_LAST_SHA:-HEAD}"
         DELETED=$(git diff --name-status "$BASE..$SYNC_CANDIDATE" | grep -c '^D' || true)
         LAST_COUNT=$(sed -n 's/^files=//p' "$STATE_FILE" 2>/dev/null || true)
         LAST_BYTES=$(sed -n 's/^bytes=//p' "$STATE_FILE" 2>/dev/null || true)
         echo "文件 $TOTAL 个 / $BYTES 字节，删除 $DELETED"
 
-        [ "$DELETED" -le "$MAX_DELETED" ] || {
-          echo "::error::${FORK}: 删除 $DELETED 个文件，超过 $MAX_DELETED"; exit 1; }
+        [ "$DELETED" -le "$MAX_DELETED" ] || err "删除 $DELETED 个文件，超过 $MAX_DELETED"
         if [ -n "$LAST_COUNT" ] && [ "$LAST_COUNT" -gt 0 ]; then
-          [ $((TOTAL * 2)) -ge "$LAST_COUNT" ] || {
-            echo "::error::${FORK}: 文件数腰斩 $LAST_COUNT → $TOTAL"; exit 1; }
+          [ $((TOTAL * 2)) -ge "$LAST_COUNT" ] || err "文件数腰斩 $LAST_COUNT → $TOTAL"
           PCT=$((DELETED * 100 / LAST_COUNT))
-          [ "$PCT" -le "$MAX_DELETE_PCT" ] || {
-            echo "::error::${FORK}: 删除比例 ${PCT}% 超过 ${MAX_DELETE_PCT}%"; exit 1; }
+          [ "$PCT" -le "$MAX_DELETE_PCT" ] || err "删除比例 ${PCT}% 超过 ${MAX_DELETE_PCT}%"
         fi
         if [ -n "$LAST_BYTES" ] && [ "$LAST_BYTES" -gt 0 ]; then
-          [ $((BYTES * 2)) -ge "$LAST_BYTES" ] || {
-            echo "::error::${FORK}: 内容腰斩 $LAST_BYTES → $BYTES 字节"; exit 1; }
+          [ $((BYTES * 2)) -ge "$LAST_BYTES" ] || err "内容腰斩 $LAST_BYTES → $BYTES 字节"
         fi
         echo "SYNC_TOTAL=$TOTAL" >> "$GITHUB_ENV"
         echo "SYNC_BYTES=$BYTES" >> "$GITHUB_ENV"
@@ -177,6 +204,12 @@ runs:
         FORK: ${{ inputs.fork }}
       run: |
         set -euo pipefail
+        err() {
+          echo "SYNC_RESULT=error" >> "$GITHUB_ENV"
+          echo "SYNC_ERROR=${1//$'\n'/ }" >> "$GITHUB_ENV"
+          echo "::error::${FORK}: $1"
+          exit 1
+        }
         cd "$SYNC_REPO"
         if git merge-base --is-ancestor HEAD "$SYNC_CANDIDATE"; then
           echo "SYNC_MODE=ff" >> "$GITHUB_ENV"
@@ -185,8 +218,7 @@ runs:
         git merge --no-commit --no-ff "$SYNC_CANDIDATE" >/dev/null 2>&1 || true
         CONFLICTS=$(git diff --name-only --diff-filter=U || true)
         git merge --abort 2>/dev/null || true
-        [ -z "$CONFLICTS" ] || {
-          echo "::error::${FORK}: 合并冲突：$CONFLICTS，未推送"; exit 1; }
+        [ -z "$CONFLICTS" ] || err "合并冲突：$CONFLICTS，未推送"
         echo "SYNC_MODE=merge" >> "$GITHUB_ENV"
 
     - name: 合并、记录状态并推送
@@ -199,6 +231,12 @@ runs:
         STATE_FILE: .github/upstream-sync-state
       run: |
         set -euo pipefail
+        err() {
+          echo "SYNC_RESULT=error" >> "$GITHUB_ENV"
+          echo "SYNC_ERROR=${1//$'\n'/ }" >> "$GITHUB_ENV"
+          echo "::error::${FORK}: $1"
+          exit 1
+        }
         cd "$SYNC_REPO"
         mkdir -p "$(dirname "$STATE_FILE")"
         if [ "$SYNC_MODE" = "ff" ]; then
@@ -212,5 +250,7 @@ runs:
           git add "$STATE_FILE"
           git commit -m "chore: auto-sync from ${UPSTREAM}@${SYNC_CANDIDATE:0:7}"
         fi
-        git push "https://x-access-token:${TOKEN}@github.com/${FORK}.git" "HEAD:refs/heads/${SYNC_FORK_BRANCH}"
+        git push "https://x-access-token:${TOKEN}@github.com/${FORK}.git" "HEAD:refs/heads/${SYNC_FORK_BRANCH}" || err "推送到 fork 失败（请检查 PAT 权限）"
+        # 供 hub 层写日志使用的结构化结果
+        echo "SYNC_DETAIL=已同步上游提交 ${SYNC_CANDIDATE:0:7}（${SYNC_MODE} 合并，文件 ${SYNC_TOTAL} 个 / ${SYNC_BYTES} 字节）" >> "$GITHUB_ENV"
         echo "- ${FORK}：完成 — 已同步上游提交 ${SYNC_CANDIDATE:0:7}（${SYNC_MODE} 合并，文件 ${SYNC_TOTAL} 个 / ${SYNC_BYTES} 字节）" >> "$GITHUB_STEP_SUMMARY"
