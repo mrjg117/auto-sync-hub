@@ -20,15 +20,49 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
+      targets: ${{ steps.targets.outputs.targets }}
     steps:
       - uses: actions/checkout@v5
       - id: targets
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: |
           set -euo pipefail
-          MATRIX=$(jq -c '{include: [
-            .projects[]
-            | select(.enabled != false)
-            | {
+          AUTO=$(jq -r '.auto_discover // false' projects.json)
+
+          # 1) 自动发现：扫描账号下所有 fork，取直接 parent 作为 upstream
+          #    这是唯一目标源——fork 被删则自动从同步列表消失
+          DISCOVERED='[]'
+          if [ "$AUTO" = "true" ]; then
+            RAW=$(gh api --paginate "user/repos?type=owner&per_page=100" \
+              --jq '[.[] | select(.fork == true) | .full_name]' | jq -s 'add' 2>/dev/null || echo '[]')
+            # 逐个取 parent.full_name（list 接口不返回 parent）
+            DISCOVERED=$(jq -r '.[]' <<< "$RAW" | while read -r f; do
+              [ -z "$f" ] && continue
+              P=$(gh api "repos/${f}" --jq '.parent.full_name // empty' 2>/dev/null || true)
+              [ -n "$P" ] && printf '%s\t%s\n' "$f" "$P"
+            done | jq -R -s 'split("\n") | map(select(length>0) | split("\t") | {fork: .[0], upstream: .[1]})')
+            echo "自动发现 fork: $(jq -c 'map(.fork)' <<< "$DISCOVERED")"
+          fi
+
+          # 2) 组装目标：
+          #    auto_discover=true  → 以扫描结果为目标源，projects 仅覆盖同名项的参数（protected_files 等）
+          #    auto_discover=false → 完全用 projects 手动列表
+          #    排除：全局 exclude、项目 skip=true、enabled=false 三者任一生效
+          MATRIX=$(jq -c --argjson disc "$DISCOVERED" --arg auto "$AUTO" '
+            (.exclude // []) as $ex
+            | (.projects // []) as $manual
+            | (if $auto == "true"
+                 then [ $disc[]
+                        | . as $d
+                        | (([$manual[] | select(.fork == $d.fork)] | first) // {}) as $m
+                        | $d + $m
+                      ]
+                 else $manual
+               end)
+            | map(select(.skip != true and .enabled != false))
+            | map(select(.fork as $f | ($ex | index($f)) == null))
+            | map({
                 name: (.name // (.fork | split("/")[1])),
                 fork: .fork,
                 upstream: .upstream,
@@ -40,9 +74,11 @@ jobs:
                 max_delete_pct: (.max_delete_pct // 30),
                 ci_gate: (.ci_gate // true),
                 follow_rename: (.follow_rename // false)
-              }
-          ]}' projects.json)
+              })
+            | {include: .}
+          ' projects.json)
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "targets=$(jq -c 'map(.fork)' <<< "$MATRIX")" >> "$GITHUB_OUTPUT"
 
   sync:
     name: 同步 ${{ matrix.name }}
