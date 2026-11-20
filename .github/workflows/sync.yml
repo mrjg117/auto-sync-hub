@@ -46,12 +46,11 @@ jobs:
           fi
 
           # 2) 组装目标：
-          #    auto_discover=true  → 以扫描结果为目标源，projects 仅覆盖同名项的参数（protected_files 等）
+          #    auto_discover=true  → 以扫描结果为目标源，projects 仅覆盖同名项的参数（含 skip）
           #    auto_discover=false → 完全用 projects 手动列表
-          #    排除：全局 exclude、项目 skip=true、enabled=false 三者任一生效
+          #    排除：项目上写 skip:true（或 enabled:false）即跳过
           MATRIX=$(jq -c --argjson disc "$DISCOVERED" --arg auto "$AUTO" '
-            (.exclude // []) as $ex
-            | (.projects // []) as $manual
+            (.projects // []) as $manual
             | (if $auto == "true"
                  then [ $disc[]
                         | . as $d
@@ -61,7 +60,6 @@ jobs:
                  else $manual
                end)
             | map(select(.skip != true and .enabled != false))
-            | map(select(.fork as $f | ($ex | index($f)) == null))
             | map({
                 name: (.name // (.fork | split("/")[1])),
                 fork: .fork,
@@ -145,7 +143,9 @@ jobs:
           else
             LINE="${TS} | 错误 | ${FORK} | ${SYNC_ERROR:-未知错误}"
           fi
-          OK=0
+          # 去重指纹：去掉时间戳后的 "状态 | 项目 | 详情"
+          SIG_NEW="${LINE#* | }"
+          OK=0; DUP=0
           for i in $(seq 1 10); do
             SHA=""; OLD_B64=""
             if GOT=$(api_get "logs/sync.log"); then
@@ -153,6 +153,11 @@ jobs:
             fi
             OLD=""
             [ -n "$OLD_B64" ] && OLD=$(printf '%s' "$OLD_B64" | base64 -d)
+            # 相同问题（同项目+同状态+同详情）已记录过则不再重复，直到该项目状态/原因变化
+            LAST=$(printf '%s\n' "$OLD" | grep -F " | ${FORK} | " | tail -n 1 || true)
+            if [ -n "$LAST" ] && [ "${LAST#* | }" = "$SIG_NEW" ]; then
+              DUP=1; OK=1; break
+            fi
             # 直接管道编码，避免命令替换吞掉末尾换行导致行粘连
             if [ -n "$OLD" ]; then
               ENCODED=$(printf '%s\n%s\n' "${OLD%$'\n'}" "$LINE" | base64 -w0)
@@ -164,7 +169,13 @@ jobs:
             fi
             sleep 2
           done
-          [ "$OK" -eq 1 ] && echo "日志已写入 logs/sync.log" || echo "::warning::${FORK}: 日志写入失败"
+          if [ "$DUP" -eq 1 ]; then
+            echo "与上次记录相同，跳过重复日志：${SIG_NEW}"
+          elif [ "$OK" -eq 1 ]; then
+            echo "日志已写入 logs/sync.log"
+          else
+            echo "::warning::${FORK}: 日志写入失败"
+          fi
 
           # ---- 改名跟随成功：回写 projects.json 的 upstream ----
           if [ -n "${SYNC_RENAMED_TO:-}" ] && [ "$RESULT" = "ok" ]; then
