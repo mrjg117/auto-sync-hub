@@ -1,28 +1,26 @@
 {
-  "projects": [
-    {
-      "fork": "mrjg117/2s-ui",
-      "upstream": "shenaba/2s-ui"
-    },
-    {
-      "fork": "mrjg117/nodewarden",
-      "upstream": "shuaiplus/nodewarden"
-    },
-    {
-      "fork": "mrjg117/Feishu-OIDC-Workers",
-      "upstream": "BrandonStudio/Feishu-OIDC-Workers"
-    },
-    {
-      "fork": "mrjg117/d1-manager",
-      "upstream": "neverinfamous/d1-manager"
-    },
-    {
-      "fork": "mrjg117/keyguard-app",
-      "upstream": "AChep/keyguard-app"
-    },
-    {
-      "fork": "mrjg117/s-ui",
-      "upstream": "alireza0/s-ui"
-    }
-  ]
+  "auto_discover": true,
+  "exclude": [],
+  "_help": {
+    "auto_discover": "true=自动扫描账号下所有 fork 并同步（fork 删除后自动移除，无需改配置）",
+    "exclude": "全局排除列表，格式 [\"owner/repo\", ...]；被列出的 fork 不参与同步",
+    "projects": "只对需要覆盖参数或排除的项目写条目；未列出的 fork 用默认值自动同步",
+    "skip": "项目级排除：设为 true 则跳过该项目（等同放进 exclude）"
+  },
+  "_example": {
+    "fork": "mrjg117/d1-manager",
+    "upstream": "neverinfamous/d1-manager",
+    "name": "d1-manager",
+    "branch": "",
+    "fork_branch": "",
+    "key_files": "",
+    "protected_files": "wrangler.toml wrangler.prod.toml",
+    "max_deleted": 50,
+    "max_delete_pct": 30,
+    "ci_gate": true,
+    "follow_rename": false,
+    "skip": false,
+    "enabled": true
+  },
+  "projects": []
 }
