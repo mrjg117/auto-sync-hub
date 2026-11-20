@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # 写日志与改名回写 projects.json
 
 concurrency:
   group: auto-sync-hub
@@ -16,6 +16,8 @@ jobs:
   prepare:
     name: 读取同步列表
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
     steps:
@@ -35,7 +37,8 @@ jobs:
                 key_files: (.key_files // ""),
                 max_deleted: (.max_deleted // 50),
                 max_delete_pct: (.max_delete_pct // 30),
-                ci_gate: (.ci_gate // true)
+                ci_gate: (.ci_gate // true),
+                follow_rename: (.follow_rename // false)
               }
           ]}' projects.json)
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
@@ -63,5 +66,65 @@ jobs:
           max-deleted: ${{ matrix.max_deleted }}
           max-delete-pct: ${{ matrix.max_delete_pct }}
           ci-gate: ${{ matrix.ci_gate }}
+          follow-rename: ${{ matrix.follow_rename }}
           token: ${{ secrets.SYNC_PAT }}
           read-token: ${{ github.token }}
+
+      - name: 记录日志并回写改名
+        if: always()
+        env:
+          OLD_UPSTREAM: ${{ matrix.upstream }}
+          FORK: ${{ matrix.fork }}
+          NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          RESULT="${SYNC_RESULT:-}"
+          # 仅"完成/错误"记日志；跳过（无更新、CI 未过、改名待确认）不写
+          if [ "$RESULT" != "ok" ] && [ "$RESULT" != "error" ]; then
+            echo "result=${RESULT:-空}，无需记录"
+            exit 0
+          fi
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          CHANGED=0
+
+          # 改名跟随成功：把配置里的 upstream 更新为新 full_name
+          if [ -n "${SYNC_RENAMED_TO:-}" ] && [ "$RESULT" = "ok" ]; then
+            jq --arg fork "$FORK" --arg new "$SYNC_RENAMED_TO" \
+              '(.projects[] | select(.fork == $fork) | .upstream) = $new' \
+              projects.json > projects.json.tmp
+            mv projects.json.tmp projects.json
+            git add projects.json && CHANGED=1
+            echo "已回写 upstream: ${OLD_UPSTREAM} -> ${SYNC_RENAMED_TO}"
+          fi
+
+          # 每个项目一个日志文件，只追加
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          SAFE=$(printf '%s' "$FORK" | tr '/' '-')
+          mkdir -p logs
+          if [ "$RESULT" = "ok" ]; then
+            LINE="${TS} | 完成 | ${SYNC_DETAIL:-同步成功}"
+          else
+            LINE="${TS} | 错误 | ${SYNC_ERROR:-未知错误}"
+          fi
+          printf '%s\n' "$LINE" >> "logs/${SAFE}.log"
+          git add "logs/${SAFE}.log" && CHANGED=1
+
+          [ "$CHANGED" -eq 1 ] || exit 0
+          git commit -m "log: ${NAME} (${RESULT})" || exit 0
+
+          # 并发安全推送：fetch + rebase 到最新 main，失败重试
+          PUSHED=0
+          for i in 1 2 3 4 5; do
+            git fetch origin main >/dev/null 2>&1 || { sleep 3; continue; }
+            if git rebase origin/main >/dev/null 2>&1; then
+              if git push origin HEAD:main >/dev/null 2>&1; then
+                PUSHED=1
+                break
+              fi
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep 3
+          done
+          [ "$PUSHED" -eq 1 ] || echo "::warning::${FORK}: 日志推送失败"
